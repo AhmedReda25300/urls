@@ -2,20 +2,11 @@ import streamlit as st
 import json
 from pathlib import Path
 import threading
-import http.server
-import socketserver
-from urllib.parse import urlparse
 
-# --- Configuration ---
-# Port for the Streamlit UI
-STREAMLIT_PORT = 8501
-# Port for the API (for GET/POST requests and webhooks)
-API_PORT = 8000
-# Define the path for the JSON file where endpoints are stored
+# --- Configuration & Data Persistence ---
+# Define the path for the JSON file where endpoints are stored.
+# Streamlit Cloud provides a persistent filesystem for your app.
 DATA_FILE = Path("endpoints.json")
-
-# --- Data Persistence Logic ---
-# A thread lock to prevent race conditions when reading/writing the file
 file_lock = threading.Lock()
 
 def load_endpoints():
@@ -35,78 +26,66 @@ def save_endpoints(endpoints_dict):
         with open(DATA_FILE, "w") as f:
             json.dump(endpoints_dict, f, indent=2)
 
-# --- API Server for GET/POST Webhooks ---
+# --- Main Application Logic ---
+st.set_page_config(page_title="API Endpoint Manager", layout="wide")
 
-class WebhookHandler(http.server.SimpleHTTPRequestHandler):
-    """Custom request handler for our API."""
+# This is an advanced technique to access the raw HTTP request.
+# It is necessary to differentiate between GET, POST, and a user visiting the UI.
+http_request = None
+try:
+    from streamlit.web.server.server import Server
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
     
-    def do_GET(self):
-        """Handles GET requests to fetch endpoint data."""
-        parsed_path = urlparse(self.path)
-        endpoint_name = parsed_path.path.strip('/')
-        
-        endpoints_data = load_endpoints()
-        
-        if endpoint_name in endpoints_data:
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(endpoints_data[endpoint_name], indent=2).encode('utf-8'))
-        else:
-            self.send_response(404)
-            self.send_header("Content-type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "Endpoint not found"}).encode('utf-8'))
+    ctx = get_script_run_ctx()
+    server = Server.get_current()
+    session_info = server._session_info_by_id.get(ctx.session_id)
+    http_request = session_info.ws.request
+except (ImportError, AttributeError):
+    st.error("Could not access request details. POST requests may not work in this Streamlit version.")
 
-    def do_POST(self):
-        """Handles POST requests to update or add data to an endpoint."""
-        parsed_path = urlparse(self.path)
-        endpoint_name = parsed_path.path.strip('/')
-        
-        endpoints_data = load_endpoints()
-        
+# Check the query parameters to see if this is an API call
+endpoint_name = st.query_params.get("endpoint", None)
+
+# --- API Handling Mode ---
+if endpoint_name and http_request:
+    endpoints_data = load_endpoints()
+    
+    # --- HANDLE POST REQUEST (from a webhook) ---
+    if http_request.method == "POST":
         if endpoint_name in endpoints_data:
             try:
-                content_length = int(self.headers['Content-Length'])
-                post_data_bytes = self.rfile.read(content_length)
-                incoming_data = json.loads(post_data_bytes)
+                # Read the body of the POST request
+                request_body = http_request.body.decode("utf-8")
+                incoming_data = json.loads(request_body)
                 
-                # Update the existing endpoint data with the new data
+                # Update the existing data and save it
                 endpoints_data[endpoint_name].update(incoming_data)
                 save_endpoints(endpoints_data)
                 
-                self.send_response(200)
-                self.send_header("Content-type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "success", "message": "Endpoint updated"}).encode('utf-8'))
-            except (json.JSONDecodeError, KeyError):
-                self.send_response(400)
-                self.send_header("Content-type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": "Bad request. Invalid JSON or missing headers."}).encode('utf-8'))
+                st.json({"status": "success", "message": f"Endpoint '{endpoint_name}' updated."})
+            except json.JSONDecodeError:
+                st.error("Bad Request: Invalid JSON in POST body.")
+                st.json({"error": "Bad Request", "status": 400})
         else:
-            self.send_response(404)
-            self.send_header("Content-type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "Endpoint not found"}).encode('utf-8'))
+            st.error(f"Endpoint '{endpoint_name}' not found.")
+            st.json({"error": "Endpoint not found", "status": 404})
+        # IMPORTANT: Stop the script after handling the API request
+        st.stop()
 
-def run_api_server():
-    """Starts the API server in a background thread."""
-    with socketserver.TCPServer(("", API_PORT), WebhookHandler) as httpd:
-        print(f"API server started on port {API_PORT}")
-        httpd.serve_forever()
+    # --- HANDLE GET REQUEST ---
+    elif http_request.method == "GET":
+        if endpoint_name in endpoints_data:
+            st.json(endpoints_data[endpoint_name])
+        else:
+            st.error(f"Endpoint '{endpoint_name}' not found.")
+            st.json({"error": "Endpoint not found", "status": 404})
+        # IMPORTANT: Stop the script after handling the API request
+        st.stop()
 
-# Start the server only once using session state as a flag
-if 'api_server_started' not in st.session_state:
-    thread = threading.Thread(target=run_api_server, daemon=True)
-    thread.start()
-    st.session_state.api_server_started = True
-
-# --- Streamlit UI ---
-
-st.set_page_config(page_title="API Endpoint Manager", layout="wide")
-st.title("🌐 API & Webhook Manager")
-st.markdown(f"Manage your endpoints below. Your API is live and listening for **GET** and **POST** requests on `http://localhost:{API_PORT}`.")
+# --- UI Management Mode ---
+# This part only runs if the URL does not contain "?endpoint=..."
+st.title("🚀 Deployed API & Webhook Manager")
+st.markdown("Manage your endpoints below. Once deployed, use the generated URLs for your webhooks.")
 
 with st.form(key="create_endpoint_form"):
     st.subheader("Create or Update an Endpoint")
@@ -114,7 +93,7 @@ with st.form(key="create_endpoint_form"):
     with col1:
         new_endpoint_name = st.text_input("Endpoint Name", placeholder="e.g., userinfo")
     with col2:
-        json_data_str = st.text_area("JSON Data", height=150, placeholder='{\n  "name": "Default Name",\n  "status": "pending"\n}')
+        json_data_str = st.text_area("Initial JSON Data", height=150, placeholder='{\n  "status": "pending"\n}')
     
     submit_button = st.form_submit_button(label="💾 Save Endpoint", use_container_width=True)
 
@@ -134,30 +113,29 @@ with st.form(key="create_endpoint_form"):
 
 st.divider()
 
-# Display existing endpoints
 endpoints_data = load_endpoints()
 if endpoints_data:
     st.subheader("📋 Your Live Endpoints")
-    base_url = f"http://localhost:{API_PORT}"
+    st.info("After deploying, replace 'localhost:8501' with your public Streamlit app URL.")
     
     cols = st.columns(2)
-    endpoints_items = list(endpoints_data.items())
-
-    for idx, (endpoint_key, endpoint_data) in enumerate(endpoints_items):
+    for idx, (key, data) in enumerate(list(endpoints_data.items())):
         with cols[idx % 2]:
             with st.container(border=True):
-                st.markdown(f"### {endpoint_key}")
+                st.markdown(f"### {key}")
                 
-                api_url = f"{base_url}/{endpoint_key}"
-                st.markdown("**API URL:**")
+                # Construct the webhook URL
+                # NOTE: Manually change this if your dev server isn't on 8501
+                api_url = f"http://localhost:8501?endpoint={key}"
+                st.markdown("**Webhook URL:**")
                 st.code(api_url, language="text")
 
                 with st.expander("View Current JSON"):
-                    st.json(endpoint_data)
+                    st.json(data)
 
-                if st.button("🗑️ Delete", key=f"del_{endpoint_key}", use_container_width=True, type="secondary"):
-                    del endpoints_data[endpoint_key]
+                if st.button("🗑️ Delete", key=f"del_{key}", use_container_width=True, type="secondary"):
+                    del endpoints_data[key]
                     save_endpoints(endpoints_data)
                     st.rerun()
 else:
-    st.info("You haven't created any endpoints yet. Use the form above to get started.")
+    st.info("Create your first endpoint using the form above.")
