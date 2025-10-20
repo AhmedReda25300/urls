@@ -2,12 +2,11 @@ import streamlit as st
 import json
 from pathlib import Path
 import threading
+import os
 
 # --- Configuration & Data Persistence ---
-# Define the path for the JSON file where endpoints are stored.
-# Streamlit Cloud provides a persistent filesystem for your app.
 DATA_FILE = Path("endpoints.json")
-file_lock = threading.Lock()
+file_lock = threading.Lock()  # Use a lock for file access safety
 
 def load_endpoints():
     """Loads the endpoints dictionary from the JSON file safely."""
@@ -29,64 +28,43 @@ def save_endpoints(endpoints_dict):
 # --- Main Application Logic ---
 st.set_page_config(page_title="API Endpoint Manager", layout="wide")
 
-# This is an advanced technique to access the raw HTTP request.
-# It is necessary to differentiate between GET, POST, and a user visiting the UI.
-http_request = None
-try:
-    from streamlit.web.server.server import Server
-    from streamlit.runtime.scriptrunner import get_script_run_ctx
-    
-    ctx = get_script_run_ctx()
-    server = Server.get_current()
-    session_info = server._session_info_by_id.get(ctx.session_id)
-    http_request = session_info.ws.request
-except (ImportError, AttributeError):
-    st.error("Could not access request details. POST requests may not work in this Streamlit version.")
+# Get the base URL dynamically for deployment
+# In Streamlit Cloud, the app's public URL can be approximated or set manually
+# For local testing, use localhost; for deployment, use the deployed URL
+BASE_URL = os.getenv("STREAMLIT_URL", "http://localhost:8501")  # Set STREAMLIT_URL in Streamlit Cloud environment variables
 
-# Check the query parameters to see if this is an API call
+# Check query parameters to determine if this is an API call
 endpoint_name = st.query_params.get("endpoint", None)
 
 # --- API Handling Mode ---
-if endpoint_name and http_request:
+if endpoint_name:
     endpoints_data = load_endpoints()
     
-    # --- HANDLE POST REQUEST (from a webhook) ---
-    if http_request.method == "POST":
-        if endpoint_name in endpoints_data:
-            try:
-                # Read the body of the POST request
-                request_body = http_request.body.decode("utf-8")
-                incoming_data = json.loads(request_body)
-                
-                # Update the existing data and save it
-                endpoints_data[endpoint_name].update(incoming_data)
-                save_endpoints(endpoints_data)
-                
-                st.json({"status": "success", "message": f"Endpoint '{endpoint_name}' updated."})
-            except json.JSONDecodeError:
-                st.error("Bad Request: Invalid JSON in POST body.")
-                st.json({"error": "Bad Request", "status": 400})
-        else:
-            st.error(f"Endpoint '{endpoint_name}' not found.")
-            st.json({"error": "Endpoint not found", "status": 404})
-        # IMPORTANT: Stop the script after handling the API request
-        st.stop()
+    # Handle POST-like requests via a hidden form (for webhook-like updates)
+    if "post_data" in st.session_state and endpoint_name in endpoints_data:
+        try:
+            incoming_data = json.loads(st.session_state.post_data)
+            endpoints_data[endpoint_name].update(incoming_data)
+            save_endpoints(endpoints_data)
+            st.json({"status": "success", "message": f"Endpoint '{endpoint_name}' updated."})
+            del st.session_state.post_data  # Clear session state
+            st.stop()
+        except json.JSONDecodeError:
+            st.json({"error": "Bad Request: Invalid JSON in POST body.", "status": 400})
+            st.stop()
 
-    # --- HANDLE GET REQUEST ---
-    elif http_request.method == "GET":
-        if endpoint_name in endpoints_data:
-            st.json(endpoints_data[endpoint_name])
-        else:
-            st.error(f"Endpoint '{endpoint_name}' not found.")
-            st.json({"error": "Endpoint not found", "status": 404})
-        # IMPORTANT: Stop the script after handling the API request
-        st.stop()
+    # Handle GET requests
+    if endpoint_name in endpoints_data:
+        st.json(endpoints_data[endpoint_name])
+    else:
+        st.json({"error": "Endpoint not found", "status": 404})
+    st.stop()
 
-# --- UI Management Mode ---
-# This part only runs if the URL does not contain "?endpoint=..."
+# --- UI Management Mode (Default View) ---
 st.title("🚀 Deployed API & Webhook Manager")
 st.markdown("Manage your endpoints below. Once deployed, use the generated URLs for your webhooks.")
 
+# Form for creating or updating endpoints
 with st.form(key="create_endpoint_form"):
     st.subheader("Create or Update an Endpoint")
     col1, col2 = st.columns([1, 2])
@@ -99,7 +77,7 @@ with st.form(key="create_endpoint_form"):
 
     if submit_button:
         if new_endpoint_name and json_data_str:
-            clean_name = new_endpoint_name.strip().lower().replace(' ', '_')
+            clean_name = new_endpoint_name.strip().lower().replace(" ", "_")
             try:
                 endpoints_data = load_endpoints()
                 endpoints_data[clean_name] = json.loads(json_data_str)
@@ -111,22 +89,48 @@ with st.form(key="create_endpoint_form"):
         else:
             st.warning("Please provide both an endpoint name and JSON data.")
 
+# Form for simulating POST requests (for testing in the UI)
+with st.form(key="post_endpoint_form"):
+    st.subheader("Test POST to Endpoint")
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        post_endpoint_name = st.text_input("Endpoint to Update", placeholder="e.g., userinfo")
+    with col2:
+        post_json_data = st.text_area("JSON Data to POST", height=150, placeholder='{\n  "status": "updated"\n}')
+    
+    post_submit_button = st.form_submit_button(label="📤 Send POST", use_container_width=True)
+
+    if post_submit_button:
+        if post_endpoint_name and post_json_data:
+            endpoints_data = load_endpoints()
+            clean_post_name = post_endpoint_name.strip().lower().replace(" ", "_")
+            if clean_post_name in endpoints_data:
+                try:
+                    st.session_state.post_data = post_json_data  # Store POST data in session state
+                    st.query_params["endpoint"] = clean_post_name  # Simulate API call
+                    st.rerun()
+                except json.JSONDecodeError:
+                    st.error("Invalid JSON format in POST data.")
+            else:
+                st.error(f"Endpoint '{clean_post_name}' not found.")
+        else:
+            st.warning("Please provide both an endpoint name and JSON data.")
+
 st.divider()
 
+# Display existing endpoints
 endpoints_data = load_endpoints()
 if endpoints_data:
     st.subheader("📋 Your Live Endpoints")
-    st.info("After deploying, replace 'localhost:8501' with your public Streamlit app URL.")
+    st.info(f"After deploying, your public URLs will look like: {BASE_URL}?endpoint=...")
     
     cols = st.columns(2)
-    for idx, (key, data) in enumerate(list(endpoints_data.items())):
+    for idx, (key, data) in enumerate(endpoints_data.items()):
         with cols[idx % 2]:
             with st.container(border=True):
                 st.markdown(f"### {key}")
                 
-                # Construct the webhook URL
-                # NOTE: Manually change this if your dev server isn't on 8501
-                api_url = f"http://localhost:8501?endpoint={key}"
+                api_url = f"{BASE_URL}?endpoint={key}"
                 st.markdown("**Webhook URL:**")
                 st.code(api_url, language="text")
 
